@@ -1612,6 +1612,123 @@ class TestCallLlmPaymentFallback:
         # Labelled as an auth error, not mis-tagged as a connection error.
         assert mock_fb.call_args.kwargs.get("reason") == "auth error"
 
+    def test_local_auth_error_triggers_fallback_in_auto_mode(self):
+        from hermes_cli.auth import AuthError
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://api.anthropic.com"
+        primary_client.chat.completions.create.side_effect = AuthError(
+            "No Anthropic credentials found. Run hermes auth anthropic.",
+            provider="anthropic",
+        )
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse(
+            "fallback auth response"
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary_client, "claude-fable-5"),
+            ),
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("auto", "claude-fable-5", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._refresh_provider_credentials",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._recover_provider_pool",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(
+                    fallback_client,
+                    "gpt-5.6-sol",
+                    "fallback_chain[0](openai-codex)",
+                ),
+            ) as mock_fallback,
+            patch("agent.auxiliary_client.time.sleep") as mock_sleep,
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "fallback auth response"
+        assert fallback_client.chat.completions.create.call_count == 1
+        assert mock_fallback.call_args.kwargs["reason"] == "auth error"
+        mock_sleep.assert_not_called()
+
+    def test_local_auth_error_does_not_change_explicit_provider(self):
+        from hermes_cli.auth import AuthError
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://api.anthropic.com"
+        auth_error = AuthError(
+            "No Anthropic credentials found. Run hermes auth anthropic.",
+            provider="anthropic",
+        )
+        primary_client.chat.completions.create.side_effect = auth_error
+
+        with (
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary_client, "claude-fable-5"),
+            ),
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=(
+                    "anthropic",
+                    "claude-fable-5",
+                    None,
+                    None,
+                    None,
+                ),
+            ),
+            patch(
+                "agent.auxiliary_client._refresh_provider_credentials",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._recover_provider_pool",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain"
+            ) as mock_fallback,
+            pytest.raises(AuthError, match="No Anthropic credentials found"),
+        ):
+            call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        mock_fallback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "No Anthropic credentials found. Run hermes auth anthropic.",
+            "No API key for Anthropic found.",
+        ],
+    )
+    def test_local_missing_credential_phrases_are_auth_errors(self, message):
+        from agent.auxiliary_client import _is_auth_error
+
+        assert _is_auth_error(RuntimeError(message)) is True
+
+    def test_generic_403_is_not_treated_as_auth_error(self):
+        from agent.auxiliary_client import _is_auth_error
+
+        class ForbiddenError(RuntimeError):
+            status_code = 403
+
+        assert _is_auth_error(ForbiddenError("Forbidden by policy")) is False
 
 
 class TestStaleFallbackCandidateSkip:

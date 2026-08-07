@@ -6825,6 +6825,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
+    def _active_fallback_runtime_for_hygiene(
+        self,
+        session_key: str,
+        session_id: str,
+    ) -> tuple[str, dict] | None:
+        """Return a snapshot of a matching cached agent's active fallback."""
+        try:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock is None or cache is None:
+                return None
+
+            with cache_lock:
+                cached = cache.get(session_key)
+                if not isinstance(cached, tuple) or len(cached) <= 3:
+                    return None
+                agent = cached[0]
+                cached_session_id = cached[3]
+                if (
+                    agent is None
+                    or agent is _AGENT_PENDING_SENTINEL
+                    or not session_id
+                    or cached_session_id != session_id
+                    or getattr(agent, "_fallback_activated", False) is not True
+                ):
+                    return None
+
+                model = str(getattr(agent, "model", "") or "").strip()
+                provider = str(getattr(agent, "provider", "") or "").strip()
+                if not model or not provider:
+                    return None
+
+                runtime: dict[str, Any] = {"provider": provider}
+                for field in (
+                    "requested_provider",
+                    "base_url",
+                    "api_key",
+                    "api_mode",
+                ):
+                    if hasattr(agent, field):
+                        runtime[field] = getattr(agent, field)
+                for field in ("credential_pool", "max_tokens"):
+                    if hasattr(agent, field):
+                        value = getattr(agent, field)
+                        if value is not None:
+                            runtime[field] = value
+                if hasattr(agent, "command"):
+                    command = getattr(agent, "command")
+                    if command is not None:
+                        runtime["command"] = command
+                if hasattr(agent, "args"):
+                    args = getattr(agent, "args")
+                    if args is not None:
+                        runtime["args"] = list(args)
+
+                return model, runtime
+        except Exception:
+            return None
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -16525,6 +16584,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_configured_model = None
             _hyg_configured_provider = None
             _hyg_configured_base_url = None
+            _hyg_runtime = {}
             _hyg_data = {}
             try:
                 _hyg_data = _load_gateway_config()
@@ -16603,11 +16663,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key=session_key,
                         user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                     )
-                    _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
-                    _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
-                    _hyg_api_key = _hyg_runtime.get("api_key") or _hyg_api_key
                 except Exception:
                     pass
+
+                _active_hyg_runtime = self._active_fallback_runtime_for_hygiene(
+                    session_key,
+                    session_entry.session_id,
+                )
+                if _active_hyg_runtime is not None:
+                    _hyg_model, _hyg_runtime = _active_hyg_runtime
+                    logger.info(
+                        "Session hygiene: following active runtime provider=%s model=%s",
+                        _hyg_runtime.get("provider"),
+                        _hyg_model,
+                    )
+
+                _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
+                _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
+                _hyg_api_key = _hyg_runtime.get("api_key") or _hyg_api_key
 
                 if _hyg_config_context_length is not None:
                     try:
@@ -16742,11 +16815,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         from agent.conversation_compression import CompressionCommitFence
                         from run_agent import AIAgent
 
-                        _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
-                            source=source,
-                            session_key=session_key,
-                            user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
-                        )
                         if _hyg_runtime.get("api_key"):
                             # Pass the FULL transcript (tool results included).
                             # Filtering to user/assistant-only starved the
@@ -16942,11 +17010,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 "Session hygiene compression for session %s "
                                                 "made no progress for %.1fs "
                                                 "(total wait %.1fs, ceiling %.1fs); "
-                                                "continuing without compression",
+                                                "continuing without compression "
+                                                "(provider=%s model=%s)",
                                                 session_entry.session_id,
                                                 _hyg_commit_fence.seconds_since_progress(),
                                                 time.monotonic() - _hyg_wait_started,
                                                 _hyg_total_ceiling_seconds,
+                                                _hyg_provider or "unknown",
+                                                _hyg_model or "unknown",
                                             )
                                             _timeout_msg = (
                                                 "⚠️ Context compression timed out "
@@ -17191,8 +17262,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         )
 
                     except Exception as e:
+                        _detail = str(e).strip() or e.__class__.__name__
                         logger.warning(
-                            "Session hygiene auto-compress failed: %s", e
+                            "Session hygiene auto-compress failed: %s", _detail
                         )
 
         # First-message onboarding -- only on the very first interaction ever.

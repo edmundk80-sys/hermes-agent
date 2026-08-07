@@ -80,6 +80,77 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+def test_active_fallback_runtime_for_hygiene_is_session_scoped():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._agent_cache_lock = threading.Lock()
+
+    active_agent = SimpleNamespace(
+        _fallback_activated=True,
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        requested_provider="auto",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="test-runtime-key",
+        api_mode="codex_responses",
+        credential_pool=SimpleNamespace(name="codex-pool"),
+        max_tokens=8192,
+    )
+    session_key = "agent:main:telegram:private:12345"
+    runner._agent_cache = {
+        session_key: (active_agent, "sig", 10, "sess-fallback")
+    }
+
+    model, runtime = runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    )
+
+    assert model == "gpt-5.6-sol"
+    assert runtime == {
+        "provider": "openai-codex",
+        "requested_provider": "auto",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "test-runtime-key",
+        "api_mode": "codex_responses",
+        "credential_pool": active_agent.credential_pool,
+        "max_tokens": 8192,
+    }
+
+    active_agent._fallback_activated = False
+    assert runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    ) is None
+
+    active_agent._fallback_activated = True
+    assert runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-other"
+    ) is None
+
+    runner._agent_cache[session_key] = (
+        gateway_run._AGENT_PENDING_SENTINEL,
+        "sig",
+        10,
+        "sess-fallback",
+    )
+    assert runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    ) is None
+
+    runner._agent_cache[session_key] = (
+        SimpleNamespace(
+            _fallback_activated=True,
+            model="gpt-5.6-sol",
+            provider="",
+        ),
+        "sig",
+        10,
+        "sess-fallback",
+    )
+    assert runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    ) is None
+
+
 # ---------------------------------------------------------------------------
 # Detection threshold tests (model-aware, unified with compression config)
 # ---------------------------------------------------------------------------
@@ -314,6 +385,130 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_session_hygiene_uses_matching_cached_fallback_runtime(
+    monkeypatch, tmp_path
+):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    class CapturingCompressAgent:
+        last_kwargs = None
+
+        def __init__(self, **kwargs):
+            type(self).last_kwargs = kwargs
+            self.session_id = kwargs.get("session_id", "sess-fallback")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            return (messages, None)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CapturingCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: HygieneCaptureAdapter()}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    session_key = "agent:main:telegram:private:12345"
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=session_key,
+        session_id="sess-fallback",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="private",
+    )
+    runner.session_store.load_transcript.return_value = _make_history(
+        6, content_size=400
+    )
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+    runner._agent_cache_lock = threading.Lock()
+    fallback_agent = SimpleNamespace(
+        _fallback_activated=True,
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        requested_provider="auto",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="test-runtime-key",
+        api_mode="codex_responses",
+        credential_pool=SimpleNamespace(name="codex-pool"),
+        max_tokens=8192,
+    )
+    runner._agent_cache = {
+        session_key: (fallback_agent, "sig", 6, "sess-fallback")
+    }
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=(
+            "claude-fable-5",
+            {
+                "provider": "anthropic",
+                "requested_provider": "auto",
+                "base_url": "https://api.anthropic.com",
+                "api_key": "test-configured-key",
+                "api_mode": "anthropic_messages",
+            },
+        )
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length_async",
+        AsyncMock(return_value=100),
+    )
+
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="private",
+            user_id="12345",
+        ),
+        message_id="1",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert runner._run_agent.await_count == 1
+    assert CapturingCompressAgent.last_kwargs is not None
+    assert CapturingCompressAgent.last_kwargs["provider"] == "openai-codex"
+    assert CapturingCompressAgent.last_kwargs["model"] == "gpt-5.6-sol"
+    assert CapturingCompressAgent.last_kwargs["base_url"] != "https://api.anthropic.com"
+
+
+@pytest.mark.asyncio
 async def test_session_hygiene_preserves_transcript_when_in_place_configured_but_no_db(monkeypatch, tmp_path):
     """Regression: when compression.in_place is True but the hygiene agent has
     no session_db, archive_and_compact cannot run — _last_compaction_in_place
@@ -413,7 +608,9 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path):
+async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(
+    monkeypatch, tmp_path, caplog
+):
     """A timed-out SessionDB-bound worker cannot compact after the live turn starts.
 
     The worker remains alive long enough to cross the old race window. The
@@ -548,6 +745,11 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     assert elapsed < 2.0
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
+    assert any(
+        record.getMessage()
+        == "Session hygiene auto-compress failed: TimeoutError"
+        for record in caplog.records
+    )
     # Cooldown must be persisted to the state DB (survives restart, #74136),
     # not stashed in an in-memory dict.
     assert fake_db.record_compression_failure_cooldown.called
@@ -905,6 +1107,41 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
     return runner, adapter, event
 
 
+@pytest.mark.asyncio
+async def test_session_hygiene_auth_error_logs_root_cause_without_watchdog(
+    monkeypatch, tmp_path, caplog
+):
+    from hermes_cli.auth import AuthError
+
+    auth_message = "No Anthropic credentials found. Run hermes auth anthropic."
+
+    class AuthFailingCompressAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "sess-progress")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            raise AuthError(auth_message, provider="anthropic")
+
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        AuthFailingCompressAgent,
+        "compression:\n  enabled: true\n  hygiene_timeout_seconds: 0.1\n",
+    )
+
+    assert await runner._handle_message(event) == "ok"
+    messages = [record.getMessage() for record in caplog.records]
+    assert f"Session hygiene auto-compress failed: {auth_message}" in messages
+    assert not any("made no progress" in message for message in messages)
+    assert runner._run_agent.await_count == 1
 
 
 # ---------------------------------------------------------------------------
