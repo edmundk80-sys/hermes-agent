@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
+    _is_auth_error,
     _is_connection_error,
     aux_interrupt_protection,
     call_llm,
@@ -77,6 +78,8 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
     if classified.reason is FailoverReason.rate_limit:
         return False
     if classified.reason in {FailoverReason.auth, FailoverReason.auth_permanent}:
+        return True
+    if _is_auth_error(exc):
         return True
 
     err_text = str(exc).lower()

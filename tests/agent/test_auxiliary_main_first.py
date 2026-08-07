@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 
 # ── Text aux tasks — _resolve_auto ──────────────────────────────────────────
@@ -116,8 +117,87 @@ class TestResolveAutoMainFirst:
         mock_main_chain.assert_not_called()
         mock_openrouter.assert_not_called()
 
+    def test_main_preflight_auth_error_is_preserved_after_exhaustion(self):
+        from agent.auxiliary_client import _resolve_auto
+        from hermes_cli.auth import AuthError
 
+        auth_error = AuthError(
+            "No Anthropic credentials found. Run hermes auth anthropic.",
+            provider="anthropic",
+        )
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=auth_error,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch("agent.auxiliary_client._get_provider_chain", return_value=[]),
+            pytest.raises(AuthError) as exc_info,
+        ):
+            _resolve_auto(
+                main_runtime={
+                    "provider": "anthropic",
+                    "model": "claude-fable-5",
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "",
+                    "api_mode": "anthropic_messages",
+                },
+                task="compression",
+            )
 
+        assert exc_info.value is auth_error
+        assert str(exc_info.value).startswith("No Anthropic credentials found")
+
+    def test_main_preflight_auth_error_continues_to_configured_fallback(self):
+        from agent.auxiliary_client import _resolve_auto
+        from hermes_cli.auth import AuthError
+
+        fallback_client = MagicMock()
+        auth_error = AuthError(
+            "No Anthropic credentials found. Run hermes auth anthropic.",
+            provider="anthropic",
+        )
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=auth_error,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(
+                    fallback_client,
+                    "gpt-5.6-sol",
+                    "fallback_chain[0](openai-codex)",
+                ),
+            ) as mock_fallback,
+            patch("agent.auxiliary_client._try_main_fallback_chain") as mock_main,
+            patch("agent.auxiliary_client._get_provider_chain") as mock_builtin,
+        ):
+            client, model = _resolve_auto(
+                main_runtime={
+                    "provider": "anthropic",
+                    "model": "claude-fable-5",
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "",
+                    "api_mode": "anthropic_messages",
+                },
+                task="compression",
+            )
+
+        assert client is fallback_client
+        assert model == "gpt-5.6-sol"
+        mock_fallback.assert_called_once_with(
+            "compression", "anthropic", reason="main provider unavailable"
+        )
+        mock_main.assert_not_called()
+        mock_builtin.assert_not_called()
 
     def test_resolve_provider_auto_returns_runtime_model_not_stale_config_default(self):
         """Blank auto aux requests must not pair a stale config model with live fallback provider."""

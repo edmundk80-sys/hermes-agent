@@ -3702,6 +3702,17 @@ def _reset_aux_unhealthy_cache() -> None:
     _aux_unhealthy_logged_at.clear()
 
 
+_STRUCTURED_PAYMENT_ERROR_CODES = frozenset({"insufficient_quota"})
+_STRUCTURED_RATE_LIMIT_ERROR_CODES = frozenset(
+    {"codex_rate_limited", "rate_limit_exceeded"}
+)
+
+
+def _structured_capacity_error_code(exc: Exception) -> str:
+    """Return a normalized provider error code used for capacity routing."""
+    return str(getattr(exc, "code", "") or "").strip().lower()
+
+
 def _is_payment_error(exc: Exception) -> bool:
     """Detect payment/credit/quota exhaustion errors.
 
@@ -3714,6 +3725,9 @@ def _is_payment_error(exc: Exception) -> bool:
     exhaustion — the provider cannot serve the request until the quota
     resets — and should trigger the same provider-fallback logic.
     """
+    structured_code = _structured_capacity_error_code(exc)
+    if structured_code in _STRUCTURED_PAYMENT_ERROR_CODES:
+        return True
     status = getattr(exc, "status_code", None)
     if status == 402:
         return True
@@ -3764,6 +3778,11 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     Also catches OpenAI SDK RateLimitError instances that may not set
     .status_code on the exception object.
     """
+    structured_code = _structured_capacity_error_code(exc)
+    if structured_code in _STRUCTURED_PAYMENT_ERROR_CODES:
+        return False
+    if structured_code in _STRUCTURED_RATE_LIMIT_ERROR_CODES:
+        return True
     status = getattr(exc, "status_code", None)
     err_lower = str(exc).lower()
 
@@ -3901,11 +3920,30 @@ def _transient_retry_count() -> int:
 
 def _is_auth_error(exc: Exception) -> bool:
     """Detect auth failures that should trigger provider-specific refresh."""
+    try:
+        from hermes_cli.auth import AuthError
+
+        if isinstance(exc, AuthError):
+            # AuthError also carries Codex/OpenAI quota and rate-limit failures.
+            # Capacity failures must fall back without refreshing valid creds.
+            if _is_payment_error(exc) or _is_rate_limit_error(exc):
+                return False
+            return True
+    except ImportError:
+        pass
+
     status = getattr(exc, "status_code", None)
     if status == 401:
         return True
-    err_lower = str(exc).lower()
+    err_lower = str(exc).strip().lower()
     if "error code: 401" in err_lower or "authenticationerror" in type(exc).__name__.lower():
+        return True
+    # Local provider resolution uses these canonical messages when credentials
+    # are absent before any HTTP request is made. Keep the compatibility match
+    # narrow so unrelated setup errors do not silently change providers.
+    if re.match(r"^no .+ credentials found(?:[.!]|$)", err_lower):
+        return True
+    if re.match(r"^no api key(?: .+)? found(?:[.!]|$)", err_lower):
         return True
     # xAI returns HTTP 403 with "unauthenticated:bad-credentials" when an OAuth2
     # access token has expired or is invalid — semantically a 401 auth failure,
@@ -5396,6 +5434,7 @@ def _resolve_auto(
     runtime_base_url = str(runtime.get("base_url") or "")
     runtime_api_key = runtime.get("api_key", "")
     runtime_api_mode = str(runtime.get("api_mode") or "")
+    main_auth_error = None
 
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
@@ -5502,13 +5541,25 @@ def _resolve_auto(
         if main_chain_label and _is_provider_unhealthy(main_chain_label):
             _log_skip_unhealthy(main_chain_label)
         else:
-            client, resolved = resolve_provider_client(
-                resolved_provider,
-                main_model,
-                explicit_base_url=explicit_base_url,
-                explicit_api_key=explicit_api_key,
-                api_mode=runtime_api_mode or None,
-            )
+            from hermes_cli.auth import AuthError
+
+            try:
+                client, resolved = resolve_provider_client(
+                    resolved_provider,
+                    main_model,
+                    explicit_base_url=explicit_base_url,
+                    explicit_api_key=explicit_api_key,
+                    api_mode=runtime_api_mode or None,
+                )
+            except AuthError as exc:
+                main_auth_error = exc
+                client, resolved = None, None
+                logger.warning(
+                    "Auxiliary auto-detect: main provider %s (%s) auth preflight failed: %s",
+                    resolved_provider,
+                    main_model,
+                    exc,
+                )
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                             main_provider, resolved or main_model)
@@ -5545,6 +5596,13 @@ def _resolve_auto(
                 logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
             return client, model
         tried.append(label)
+    if main_auth_error is not None:
+        logger.warning(
+            "Auxiliary auto-detect: all fallbacks exhausted after %s (%s) auth preflight failure",
+            main_provider,
+            main_model,
+        )
+        raise main_auth_error
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "
                    "Set OPENROUTER_API_KEY or configure a local model in config.yaml.",
