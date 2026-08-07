@@ -94,9 +94,19 @@ def test_active_fallback_runtime_for_hygiene_is_session_scoped():
         api_key="test-runtime-key",
         api_mode="codex_responses",
         _credential_pool=SimpleNamespace(name="codex-pool"),
-        acp_command=None,
-        acp_args=[],
         max_tokens=8192,
+    )
+    active_agent._current_constructor_runtime = lambda: (
+        active_agent.model,
+        {
+            "provider": active_agent.provider,
+            "requested_provider": active_agent.requested_provider,
+            "base_url": active_agent.base_url,
+            "api_key": active_agent.api_key,
+            "api_mode": active_agent.api_mode,
+            "credential_pool": active_agent._credential_pool,
+            "max_tokens": active_agent.max_tokens,
+        },
     )
     session_key = "agent:main:telegram:private:12345"
     runner._agent_cache = {
@@ -116,7 +126,6 @@ def test_active_fallback_runtime_for_hygiene_is_session_scoped():
         "api_mode": "codex_responses",
         "credential_pool": active_agent._credential_pool,
         "max_tokens": 8192,
-        "args": [],
     }
 
     active_agent._fallback_activated = False
@@ -144,6 +153,10 @@ def test_active_fallback_runtime_for_hygiene_is_session_scoped():
             _fallback_activated=True,
             model="gpt-5.6-sol",
             provider="",
+            _current_constructor_runtime=lambda: (
+                "gpt-5.6-sol",
+                {"provider": ""},
+            ),
         ),
         "sig",
         10,
@@ -155,8 +168,9 @@ def test_active_fallback_runtime_for_hygiene_is_session_scoped():
 
 
 def test_active_fallback_runtime_snapshot_matches_real_aiagent_storage():
-    """The hygiene snapshot must map the attributes initialized by AIAgent."""
+    """The canonical snapshot reads ACP settings from the active client."""
     gateway_run = importlib.import_module("gateway.run")
+    from agent.copilot_acp_client import CopilotACPClient
     from run_agent import AIAgent
 
     runner = object.__new__(gateway_run.GatewayRunner)
@@ -173,8 +187,13 @@ def test_active_fallback_runtime_snapshot_matches_real_aiagent_storage():
         ("api_key", "test-runtime-key"),
         ("api_mode", "chat_completions"),
         ("_credential_pool", credential_pool),
-        ("acp_command", "/opt/copilot/custom-agent"),
-        ("acp_args", acp_args),
+        (
+            "client",
+            CopilotACPClient(
+                command="/opt/copilot/custom-agent",
+                args=acp_args,
+            ),
+        ),
     ):
         setattr(active_agent, field, value)
     active_agent.base_url = "acp://copilot"
@@ -195,16 +214,89 @@ def test_active_fallback_runtime_snapshot_matches_real_aiagent_storage():
     assert runtime["args"] is not acp_args
 
 
+def test_active_fallback_runtime_snapshot_reconstructs_live_copilot_acp_process(
+    monkeypatch,
+):
+    """A real fallback transition must preserve the ACP process constructor runtime."""
+    gateway_run = importlib.import_module("gateway.run")
+    run_agent = importlib.import_module("run_agent")
+    copilot_acp = importlib.import_module("agent.copilot_acp_client")
+    from agent.copilot_acp_client import CopilotACPClient
+    from run_agent import AIAgent
+
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run_agent, "OpenAI", MagicMock())
+    custom_command = sys.executable
+    monkeypatch.setenv("HERMES_COPILOT_ACP_COMMAND", custom_command)
+    monkeypatch.setenv(
+        "HERMES_COPILOT_ACP_ARGS",
+        "--stdio --profile fallback",
+    )
+
+    active_agent = AIAgent(
+        model="anthropic/claude-sonnet-4.6",
+        provider="openrouter",
+        api_key="test-primary-key",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    active_agent._fallback_chain = [
+        {
+            "provider": "copilot-acp",
+            "model": "gpt-5-mini",
+            "base_url": "acp://copilot",
+        }
+    ]
+    active_agent._fallback_index = 0
+    active_agent._fallback_activated = False
+
+    assert active_agent._try_activate_fallback() is True
+    fallback_client = active_agent.client
+    assert isinstance(fallback_client, CopilotACPClient)
+    assert fallback_client._acp_command == custom_command
+    assert fallback_client._acp_args == ["--stdio", "--profile", "fallback"]
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._agent_cache_lock = threading.Lock()
+    session_key = "agent:main:telegram:private:12345"
+    runner._agent_cache = {
+        session_key: (active_agent, "sig", 10, "sess-fallback")
+    }
+
+    model, runtime = runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    )
+
+    reconstructed_client = MagicMock()
+    reconstruct = MagicMock(return_value=reconstructed_client)
+    monkeypatch.setattr(copilot_acp, "CopilotACPClient", reconstruct)
+    helper = AIAgent(
+        model=model,
+        **runtime,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    assert helper.client is reconstructed_client
+    assert reconstruct.call_args.kwargs["command"] == custom_command
+    assert reconstruct.call_args.kwargs["args"] == [
+        "--stdio",
+        "--profile",
+        "fallback",
+    ]
+
+
 def test_active_fallback_runtime_snapshot_logs_exception_class_only(caplog):
     gateway_run = importlib.import_module("gateway.run")
 
     class BrokenRuntimeAgent:
         _fallback_activated = True
-        model = "gpt-5.6-sol"
-        provider = "openai-codex"
 
-        @property
-        def requested_provider(self):
+        def _current_constructor_runtime(self):
             raise RuntimeError("secret snapshot payload")
 
     runner = object.__new__(gateway_run.GatewayRunner)
@@ -537,9 +629,19 @@ async def test_session_hygiene_uses_matching_cached_fallback_runtime(
         api_key="test-runtime-key",
         api_mode="codex_responses",
         _credential_pool=SimpleNamespace(name="codex-pool"),
-        acp_command="/opt/copilot/custom-agent",
-        acp_args=["--stdio", "--profile", "fallback"],
         max_tokens=8192,
+    )
+    fallback_agent._current_constructor_runtime = lambda: (
+        fallback_agent.model,
+        {
+            "provider": fallback_agent.provider,
+            "requested_provider": fallback_agent.requested_provider,
+            "base_url": fallback_agent.base_url,
+            "api_key": fallback_agent.api_key,
+            "api_mode": fallback_agent.api_mode,
+            "credential_pool": fallback_agent._credential_pool,
+            "max_tokens": fallback_agent.max_tokens,
+        },
     )
     runner._agent_cache = {
         session_key: (fallback_agent, "sig", 6, "sess-fallback")
@@ -588,8 +690,7 @@ async def test_session_hygiene_uses_matching_cached_fallback_runtime(
         CapturingCompressAgent.last_kwargs["credential_pool"]
         is fallback_agent._credential_pool
     )
-    assert CapturingCompressAgent.last_kwargs["command"] == fallback_agent.acp_command
-    assert CapturingCompressAgent.last_kwargs["args"] == fallback_agent.acp_args
+
 
 
 @pytest.mark.asyncio
@@ -1196,9 +1297,15 @@ async def test_session_hygiene_auth_error_logs_root_cause_without_watchdog(
     monkeypatch, tmp_path, caplog
 ):
     from agent.context_compressor import ContextCompressor
+    from agent.redact import redact_sensitive_text
     from hermes_cli.auth import AuthError
 
-    auth_message = "No Anthropic credentials found. Run hermes auth anthropic."
+    auth_message = (
+        "No Anthropic credentials found for "
+        + "sk-ant-"
+        + "api03-test-secret-value. Run hermes auth anthropic."
+    )
+    redacted_auth_message = redact_sensitive_text(auth_message, force=True)
 
     class AuthFailingCompressAgent:
         last_instance = None
@@ -1238,7 +1345,7 @@ async def test_session_hygiene_auth_error_logs_root_cause_without_watchdog(
         MagicMock(side_effect=AuthError(auth_message, provider="anthropic")),
     )
 
-    runner, _adapter, event = _make_progress_runner(
+    runner, adapter, event = _make_progress_runner(
         monkeypatch,
         tmp_path,
         AuthFailingCompressAgent,
@@ -1247,7 +1354,20 @@ async def test_session_hygiene_auth_error_logs_root_cause_without_watchdog(
 
     assert await runner._handle_message(event) == "ok"
     messages = [record.getMessage() for record in caplog.records]
-    assert f"Session hygiene auto-compress failed: {auth_message}" in messages
+    gateway_failures = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "gateway.run"
+        and record.getMessage().startswith("Session hygiene auto-compress failed:")
+    ]
+    assert (
+        f"Session hygiene auto-compress failed: {redacted_auth_message}"
+        in gateway_failures
+    )
+    assert not any(auth_message in message for message in gateway_failures)
+    assert adapter.sent
+    assert redacted_auth_message in adapter.sent[-1]["content"]
+    assert auth_message not in adapter.sent[-1]["content"]
     assert not any("made no progress" in message for message in messages)
     assert AuthFailingCompressAgent.last_instance is not None
     compressor = AuthFailingCompressAgent.last_instance.context_compressor

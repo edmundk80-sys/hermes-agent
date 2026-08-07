@@ -6830,12 +6830,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         session_id: str,
     ) -> tuple[str, dict[str, Any]] | None:
-        """Copy a matching cached agent's active fallback constructor runtime.
-
-        ``AIAgent`` stores some constructor inputs under different runtime
-        attribute names. Keep that private-to-public translation explicit here
-        so hygiene rebuilds the same credential pool and ACP process runtime.
-        """
+        """Copy a matching cached agent's active fallback constructor runtime."""
         try:
             cache_lock = getattr(self, "_agent_cache_lock", None)
             cache = getattr(self, "_agent_cache", None)
@@ -6857,36 +6852,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     return None
 
-                model = str(getattr(agent, "model", "") or "").strip()
-                provider = str(getattr(agent, "provider", "") or "").strip()
+                snapshot_runtime = getattr(
+                    agent, "_current_constructor_runtime", None
+                )
+                if not callable(snapshot_runtime):
+                    return None
+                model, runtime = cast(
+                    Callable[[], tuple[str, dict[str, Any]]], snapshot_runtime
+                )()
+                model = str(model or "").strip()
+                provider = str(runtime.get("provider") or "").strip()
                 if not model or not provider:
                     return None
-
-                runtime: dict[str, Any] = {"provider": provider}
-                for field in (
-                    "requested_provider",
-                    "base_url",
-                    "api_key",
-                    "api_mode",
-                ):
-                    if hasattr(agent, field):
-                        runtime[field] = getattr(agent, field)
-                for source_field, runtime_field in (
-                    ("_credential_pool", "credential_pool"),
-                    ("max_tokens", "max_tokens"),
-                ):
-                    if hasattr(agent, source_field):
-                        value = getattr(agent, source_field)
-                        if value is not None:
-                            runtime[runtime_field] = value
-                if hasattr(agent, "acp_command"):
-                    command = getattr(agent, "acp_command")
-                    if command is not None:
-                        runtime["command"] = command
-                if hasattr(agent, "acp_args"):
-                    args = getattr(agent, "acp_args")
-                    if args is not None:
-                        runtime["args"] = list(args)
 
                 return model, runtime
         except Exception as exc:
@@ -17217,15 +17194,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             "activity stamp failed",
                                         )
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
+                                        # Force-redact provider exception text before
+                                        # it reaches either logs or gateway users.
+                                        from agent.redact import redact_sensitive_text
+                                        _err = redact_sensitive_text(_err, force=True)
                                         logger.warning(
                                             "Session hygiene auto-compress failed: %s",
                                             _err,
                                         )
-                                        # Force-redact: provider exception text
-                                        # may contain credentials; this message
-                                        # reaches gateway users directly.
-                                        from agent.redact import redact_sensitive_text
-                                        _err = redact_sensitive_text(_err, force=True)
                                         _warn_msg = (
                                             "⚠️ Context compression aborted "
                                             f"({_err}). No messages were dropped — "
