@@ -80,6 +80,243 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+def test_active_fallback_runtime_for_hygiene_is_session_scoped():
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._agent_cache_lock = threading.Lock()
+
+    active_agent = SimpleNamespace(
+        _fallback_activated=True,
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        requested_provider="auto",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="test-runtime-key",
+        api_mode="codex_responses",
+        _credential_pool=SimpleNamespace(name="codex-pool"),
+        max_tokens=8192,
+    )
+    active_agent._current_constructor_runtime = lambda: (
+        active_agent.model,
+        {
+            "provider": active_agent.provider,
+            "requested_provider": active_agent.requested_provider,
+            "base_url": active_agent.base_url,
+            "api_key": active_agent.api_key,
+            "api_mode": active_agent.api_mode,
+            "credential_pool": active_agent._credential_pool,
+            "max_tokens": active_agent.max_tokens,
+        },
+    )
+    session_key = "agent:main:telegram:private:12345"
+    runner._agent_cache = {
+        session_key: (active_agent, "sig", 10, "sess-fallback")
+    }
+
+    model, runtime = runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    )
+
+    assert model == "gpt-5.6-sol"
+    assert runtime == {
+        "provider": "openai-codex",
+        "requested_provider": "auto",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "test-runtime-key",
+        "api_mode": "codex_responses",
+        "credential_pool": active_agent._credential_pool,
+        "max_tokens": 8192,
+    }
+
+    active_agent._fallback_activated = False
+    assert runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    ) is None
+
+    active_agent._fallback_activated = True
+    assert runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-other"
+    ) is None
+
+    runner._agent_cache[session_key] = (
+        gateway_run._AGENT_PENDING_SENTINEL,
+        "sig",
+        10,
+        "sess-fallback",
+    )
+    assert runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    ) is None
+
+    runner._agent_cache[session_key] = (
+        SimpleNamespace(
+            _fallback_activated=True,
+            model="gpt-5.6-sol",
+            provider="",
+            _current_constructor_runtime=lambda: (
+                "gpt-5.6-sol",
+                {"provider": ""},
+            ),
+        ),
+        "sig",
+        10,
+        "sess-fallback",
+    )
+    assert runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    ) is None
+
+
+def test_active_fallback_runtime_snapshot_matches_real_aiagent_storage():
+    """The canonical snapshot reads ACP settings from the active client."""
+    gateway_run = importlib.import_module("gateway.run")
+    from agent.copilot_acp_client import CopilotACPClient
+    from run_agent import AIAgent
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._agent_cache_lock = threading.Lock()
+
+    active_agent = object.__new__(AIAgent)
+    credential_pool = SimpleNamespace(name="copilot-pool")
+    acp_args = ["--stdio", "--profile", "fallback"]
+    for field, value in (
+        ("_fallback_activated", True),
+        ("model", "gpt-5.6-sol"),
+        ("provider", "copilot-acp"),
+        ("requested_provider", "auto"),
+        ("api_key", "test-runtime-key"),
+        ("api_mode", "chat_completions"),
+        ("_credential_pool", credential_pool),
+        (
+            "client",
+            CopilotACPClient(
+                command="/opt/copilot/custom-agent",
+                args=acp_args,
+            ),
+        ),
+    ):
+        setattr(active_agent, field, value)
+    active_agent.base_url = "acp://copilot"
+
+    session_key = "agent:main:telegram:private:12345"
+    runner._agent_cache = {
+        session_key: (active_agent, "sig", 10, "sess-fallback")
+    }
+
+    model, runtime = runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    )
+
+    assert model == "gpt-5.6-sol"
+    assert runtime["credential_pool"] is credential_pool
+    assert runtime["command"] == "/opt/copilot/custom-agent"
+    assert runtime["args"] == acp_args
+    assert runtime["args"] is not acp_args
+
+
+def test_active_fallback_runtime_snapshot_reconstructs_live_copilot_acp_process(
+    monkeypatch,
+):
+    """A real fallback transition must preserve the ACP process constructor runtime."""
+    gateway_run = importlib.import_module("gateway.run")
+    run_agent = importlib.import_module("run_agent")
+    copilot_acp = importlib.import_module("agent.copilot_acp_client")
+    from agent.copilot_acp_client import CopilotACPClient
+    from run_agent import AIAgent
+
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run_agent, "OpenAI", MagicMock())
+    custom_command = sys.executable
+    monkeypatch.setenv("HERMES_COPILOT_ACP_COMMAND", custom_command)
+    monkeypatch.setenv(
+        "HERMES_COPILOT_ACP_ARGS",
+        "--stdio --profile fallback",
+    )
+
+    active_agent = AIAgent(
+        model="anthropic/claude-sonnet-4.6",
+        provider="openrouter",
+        api_key="test-primary-key",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    active_agent._fallback_chain = [
+        {
+            "provider": "copilot-acp",
+            "model": "gpt-5-mini",
+            "base_url": "acp://copilot",
+        }
+    ]
+    active_agent._fallback_index = 0
+    active_agent._fallback_activated = False
+
+    assert active_agent._try_activate_fallback() is True
+    fallback_client = active_agent.client
+    assert isinstance(fallback_client, CopilotACPClient)
+    assert fallback_client._acp_command == custom_command
+    assert fallback_client._acp_args == ["--stdio", "--profile", "fallback"]
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._agent_cache_lock = threading.Lock()
+    session_key = "agent:main:telegram:private:12345"
+    runner._agent_cache = {
+        session_key: (active_agent, "sig", 10, "sess-fallback")
+    }
+
+    model, runtime = runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    )
+
+    reconstructed_client = MagicMock()
+    reconstruct = MagicMock(return_value=reconstructed_client)
+    monkeypatch.setattr(copilot_acp, "CopilotACPClient", reconstruct)
+    helper = AIAgent(
+        model=model,
+        **runtime,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    assert helper.client is reconstructed_client
+    assert reconstruct.call_args.kwargs["command"] == custom_command
+    assert reconstruct.call_args.kwargs["args"] == [
+        "--stdio",
+        "--profile",
+        "fallback",
+    ]
+
+
+def test_active_fallback_runtime_snapshot_logs_exception_class_only(caplog):
+    gateway_run = importlib.import_module("gateway.run")
+
+    class BrokenRuntimeAgent:
+        _fallback_activated = True
+
+        def _current_constructor_runtime(self):
+            raise RuntimeError("secret snapshot payload")
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._agent_cache_lock = threading.Lock()
+    session_key = "agent:main:telegram:private:12345"
+    runner._agent_cache = {
+        session_key: (BrokenRuntimeAgent(), "sig", 10, "sess-fallback")
+    }
+
+    with caplog.at_level("DEBUG", logger="gateway.run"):
+        result = runner._active_fallback_runtime_for_hygiene(
+            session_key, "sess-fallback"
+        )
+
+    assert result is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Session hygiene fallback runtime snapshot failed (RuntimeError)" in messages
+    assert not any("secret snapshot payload" in message for message in messages)
+
+
 # ---------------------------------------------------------------------------
 # Detection threshold tests (model-aware, unified with compression config)
 # ---------------------------------------------------------------------------
@@ -314,6 +551,149 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_session_hygiene_uses_matching_cached_fallback_runtime(
+    monkeypatch, tmp_path
+):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    class CapturingCompressAgent:
+        last_kwargs = None
+
+        def __init__(self, **kwargs):
+            type(self).last_kwargs = kwargs
+            self.session_id = kwargs.get("session_id", "sess-fallback")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            return (messages, None)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CapturingCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: HygieneCaptureAdapter()}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    session_key = "agent:main:telegram:private:12345"
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=session_key,
+        session_id="sess-fallback",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="private",
+    )
+    runner.session_store.load_transcript.return_value = _make_history(
+        6, content_size=400
+    )
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+    runner._agent_cache_lock = threading.Lock()
+    fallback_agent = SimpleNamespace(
+        _fallback_activated=True,
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        requested_provider="auto",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="test-runtime-key",
+        api_mode="codex_responses",
+        _credential_pool=SimpleNamespace(name="codex-pool"),
+        max_tokens=8192,
+    )
+    fallback_agent._current_constructor_runtime = lambda: (
+        fallback_agent.model,
+        {
+            "provider": fallback_agent.provider,
+            "requested_provider": fallback_agent.requested_provider,
+            "base_url": fallback_agent.base_url,
+            "api_key": fallback_agent.api_key,
+            "api_mode": fallback_agent.api_mode,
+            "credential_pool": fallback_agent._credential_pool,
+            "max_tokens": fallback_agent.max_tokens,
+        },
+    )
+    runner._agent_cache = {
+        session_key: (fallback_agent, "sig", 6, "sess-fallback")
+    }
+    runner._resolve_session_agent_runtime = MagicMock(
+        return_value=(
+            "claude-fable-5",
+            {
+                "provider": "anthropic",
+                "requested_provider": "auto",
+                "base_url": "https://api.anthropic.com",
+                "api_key": "test-configured-key",
+                "api_mode": "anthropic_messages",
+            },
+        )
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length_async",
+        AsyncMock(return_value=100),
+    )
+
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="private",
+            user_id="12345",
+        ),
+        message_id="1",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert runner._run_agent.await_count == 1
+    assert CapturingCompressAgent.last_kwargs is not None
+    assert CapturingCompressAgent.last_kwargs["provider"] == "openai-codex"
+    assert CapturingCompressAgent.last_kwargs["model"] == "gpt-5.6-sol"
+    assert CapturingCompressAgent.last_kwargs["base_url"] == fallback_agent.base_url
+    assert CapturingCompressAgent.last_kwargs["api_key"] == fallback_agent.api_key
+    assert CapturingCompressAgent.last_kwargs["api_mode"] == fallback_agent.api_mode
+    assert (
+        CapturingCompressAgent.last_kwargs["credential_pool"]
+        is fallback_agent._credential_pool
+    )
+
+
+
+@pytest.mark.asyncio
 async def test_session_hygiene_preserves_transcript_when_in_place_configured_but_no_db(monkeypatch, tmp_path):
     """Regression: when compression.in_place is True but the hygiene agent has
     no session_db, archive_and_compact cannot run — _last_compaction_in_place
@@ -413,7 +793,9 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path):
+async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(
+    monkeypatch, tmp_path, caplog
+):
     """A timed-out SessionDB-bound worker cannot compact after the live turn starts.
 
     The worker remains alive long enough to cross the old race window. The
@@ -548,6 +930,11 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     assert elapsed < 2.0
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
+    assert any(
+        record.getMessage()
+        == "Session hygiene auto-compress failed: TimeoutError"
+        for record in caplog.records
+    )
     # Cooldown must be persisted to the state DB (survives restart, #74136),
     # not stashed in an in-memory dict.
     assert fake_db.record_compression_failure_cooldown.called
@@ -905,6 +1292,89 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
     return runner, adapter, event
 
 
+@pytest.mark.asyncio
+async def test_session_hygiene_auth_error_logs_root_cause_without_watchdog(
+    monkeypatch, tmp_path, caplog
+):
+    from agent.context_compressor import ContextCompressor
+    from agent.redact import redact_sensitive_text
+    from hermes_cli.auth import AuthError
+
+    auth_message = (
+        "No Anthropic credentials found for "
+        + "sk-ant-"
+        + "api03-test-secret-value. Run hermes auth anthropic."
+    )
+    redacted_auth_message = redact_sensitive_text(auth_message, force=True)
+
+    class AuthFailingCompressAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "sess-progress")
+            self._last_compaction_in_place = False
+            self.context_compressor = ContextCompressor(
+                model=kwargs.get("model", "claude-fable-5"),
+                provider=kwargs.get("provider", "anthropic"),
+                base_url=kwargs.get("base_url", "https://api.anthropic.com"),
+                api_key=kwargs.get("api_key", "fake"),
+                api_mode=kwargs.get("api_mode", "anthropic_messages"),
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+                abort_on_summary_failure=False,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+            type(self).last_instance = self
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            compressed = self.context_compressor.compress(
+                messages,
+                current_tokens=999_999,
+                force=True,
+            )
+            return compressed, None
+
+    monkeypatch.setattr(
+        "agent.context_compressor.get_model_context_length",
+        lambda *_args, **_kwargs: 1_000,
+    )
+    monkeypatch.setattr(
+        "agent.context_compressor.call_llm",
+        MagicMock(side_effect=AuthError(auth_message, provider="anthropic")),
+    )
+
+    runner, adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        AuthFailingCompressAgent,
+        "compression:\n  enabled: true\n  hygiene_timeout_seconds: 5\n",
+    )
+
+    assert await runner._handle_message(event) == "ok"
+    messages = [record.getMessage() for record in caplog.records]
+    gateway_failures = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "gateway.run"
+        and record.getMessage().startswith("Session hygiene auto-compress failed:")
+    ]
+    assert (
+        f"Session hygiene auto-compress failed: {redacted_auth_message}"
+        in gateway_failures
+    )
+    assert not any(auth_message in message for message in gateway_failures)
+    assert adapter.sent
+    assert redacted_auth_message in adapter.sent[-1]["content"]
+    assert auth_message not in adapter.sent[-1]["content"]
+    assert not any("made no progress" in message for message in messages)
+    assert AuthFailingCompressAgent.last_instance is not None
+    compressor = AuthFailingCompressAgent.last_instance.context_compressor
+    assert compressor._last_compress_aborted is True
+    assert compressor._last_summary_fallback_used is False
+    assert compressor._last_summary_dropped_count == 0
+    assert runner._run_agent.await_count == 1
 
 
 # ---------------------------------------------------------------------------

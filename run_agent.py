@@ -1314,6 +1314,42 @@ class AIAgent:
             "auth_mode": getattr(self, "auth_mode", "") or "",
         }
 
+    def _current_constructor_runtime(self) -> tuple[str, Dict[str, Any]]:
+        """Snapshot constructor inputs for the active client/runtime."""
+        model = str(getattr(self, "model", "") or "").strip()
+        runtime: Dict[str, Any] = {
+            "provider": str(getattr(self, "provider", "") or "").strip(),
+        }
+        for field in (
+            "requested_provider",
+            "base_url",
+            "api_key",
+            "api_mode",
+        ):
+            if hasattr(self, field):
+                runtime[field] = getattr(self, field)
+
+        credential_pool = getattr(self, "_credential_pool", None)
+        if credential_pool is not None:
+            runtime["credential_pool"] = credential_pool
+        max_tokens = getattr(self, "max_tokens", None)
+        if max_tokens is not None:
+            runtime["max_tokens"] = max_tokens
+
+        client = getattr(self, "client", None)
+        if runtime["provider"].lower() == "copilot-acp" and client is not None:
+            from agent.copilot_acp_client import CopilotACPClient
+
+            if isinstance(client, CopilotACPClient):
+                command = getattr(client, "_acp_command", None)
+                if command is not None:
+                    runtime["command"] = command
+                args = getattr(client, "_acp_args", None)
+                if args is not None:
+                    runtime["args"] = list(args)
+
+        return model, runtime
+
     def _check_compression_model_feasibility(self) -> None:
         """Forwarder — see ``agent.conversation_compression.check_compression_model_feasibility``."""
         from agent.conversation_compression import check_compression_model_feasibility
