@@ -1471,6 +1471,34 @@ class TestIsRateLimitError:
         # No status_code set, but class name matches
         assert _is_rate_limit_error(exc) is True
 
+    @pytest.mark.parametrize(
+        ("code", "status", "is_rate_limit", "is_payment"),
+        [
+            ("codex_rate_limited", None, True, False),
+            ("rate_limit_exceeded", 429, True, False),
+            ("insufficient_quota", 429, False, True),
+            (None, 429, True, False),
+        ],
+    )
+    def test_structured_quota_auth_errors_are_capacity_not_auth(
+        self, code, status, is_rate_limit, is_payment
+    ):
+        from agent.auxiliary_client import _is_auth_error
+        from hermes_cli.auth import AuthError
+
+        exc = AuthError(
+            "Structured OpenAI capacity failure",
+            provider="openai-codex",
+            code=code,
+            relogin_required=False,
+        )
+        if status is not None:
+            setattr(exc, "status_code", status)
+
+        assert _is_auth_error(exc) is False
+        assert _is_rate_limit_error(exc) is is_rate_limit
+        assert _is_payment_error(exc) is is_payment
+
 
 
 class TestGetProviderChain:
@@ -1579,6 +1607,58 @@ class TestCallLlmPaymentFallback:
             )
         # Fallback client should have been used
         assert fallback_client.chat.completions.create.called
+
+    def test_codex_structured_rate_limit_skips_auth_refresh(self):
+        from hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://chatgpt.com/backend-api/codex"
+        primary_client.chat.completions.create.side_effect = AuthError(
+            "Codex provider quota exhausted (429). Credentials are still valid.",
+            provider="openai-codex",
+            code=CODEX_RATE_LIMITED_CODE,
+            relogin_required=False,
+        )
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse(
+            "fallback rate-limit response"
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary_client, "gpt-5.6-sol"),
+            ),
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("auto", "gpt-5.6-sol", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._refresh_provider_credentials",
+                return_value=False,
+            ) as mock_refresh,
+            patch(
+                "agent.auxiliary_client._recover_provider_pool",
+                return_value=False,
+            ),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(
+                    fallback_client,
+                    "fallback-model",
+                    "fallback_chain[0](openrouter)",
+                ),
+            ) as mock_fallback,
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "fallback rate-limit response"
+        mock_refresh.assert_not_called()
+        assert mock_fallback.call_args.kwargs["reason"] == "rate limit"
 
     def test_401_auth_error_triggers_fallback_in_auto_mode(self, monkeypatch):
         """401 auth errors should trigger fallback in auto mode (#21165).

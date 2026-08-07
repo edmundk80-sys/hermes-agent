@@ -93,7 +93,9 @@ def test_active_fallback_runtime_for_hygiene_is_session_scoped():
         base_url="https://chatgpt.com/backend-api/codex",
         api_key="test-runtime-key",
         api_mode="codex_responses",
-        credential_pool=SimpleNamespace(name="codex-pool"),
+        _credential_pool=SimpleNamespace(name="codex-pool"),
+        acp_command=None,
+        acp_args=[],
         max_tokens=8192,
     )
     session_key = "agent:main:telegram:private:12345"
@@ -112,8 +114,9 @@ def test_active_fallback_runtime_for_hygiene_is_session_scoped():
         "base_url": "https://chatgpt.com/backend-api/codex",
         "api_key": "test-runtime-key",
         "api_mode": "codex_responses",
-        "credential_pool": active_agent.credential_pool,
+        "credential_pool": active_agent._credential_pool,
         "max_tokens": 8192,
+        "args": [],
     }
 
     active_agent._fallback_activated = False
@@ -149,6 +152,77 @@ def test_active_fallback_runtime_for_hygiene_is_session_scoped():
     assert runner._active_fallback_runtime_for_hygiene(
         session_key, "sess-fallback"
     ) is None
+
+
+def test_active_fallback_runtime_snapshot_matches_real_aiagent_storage():
+    """The hygiene snapshot must map the attributes initialized by AIAgent."""
+    gateway_run = importlib.import_module("gateway.run")
+    from run_agent import AIAgent
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._agent_cache_lock = threading.Lock()
+
+    active_agent = object.__new__(AIAgent)
+    credential_pool = SimpleNamespace(name="copilot-pool")
+    acp_args = ["--stdio", "--profile", "fallback"]
+    for field, value in (
+        ("_fallback_activated", True),
+        ("model", "gpt-5.6-sol"),
+        ("provider", "copilot-acp"),
+        ("requested_provider", "auto"),
+        ("api_key", "test-runtime-key"),
+        ("api_mode", "chat_completions"),
+        ("_credential_pool", credential_pool),
+        ("acp_command", "/opt/copilot/custom-agent"),
+        ("acp_args", acp_args),
+    ):
+        setattr(active_agent, field, value)
+    active_agent.base_url = "acp://copilot"
+
+    session_key = "agent:main:telegram:private:12345"
+    runner._agent_cache = {
+        session_key: (active_agent, "sig", 10, "sess-fallback")
+    }
+
+    model, runtime = runner._active_fallback_runtime_for_hygiene(
+        session_key, "sess-fallback"
+    )
+
+    assert model == "gpt-5.6-sol"
+    assert runtime["credential_pool"] is credential_pool
+    assert runtime["command"] == "/opt/copilot/custom-agent"
+    assert runtime["args"] == acp_args
+    assert runtime["args"] is not acp_args
+
+
+def test_active_fallback_runtime_snapshot_logs_exception_class_only(caplog):
+    gateway_run = importlib.import_module("gateway.run")
+
+    class BrokenRuntimeAgent:
+        _fallback_activated = True
+        model = "gpt-5.6-sol"
+        provider = "openai-codex"
+
+        @property
+        def requested_provider(self):
+            raise RuntimeError("secret snapshot payload")
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._agent_cache_lock = threading.Lock()
+    session_key = "agent:main:telegram:private:12345"
+    runner._agent_cache = {
+        session_key: (BrokenRuntimeAgent(), "sig", 10, "sess-fallback")
+    }
+
+    with caplog.at_level("DEBUG", logger="gateway.run"):
+        result = runner._active_fallback_runtime_for_hygiene(
+            session_key, "sess-fallback"
+        )
+
+    assert result is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Session hygiene fallback runtime snapshot failed (RuntimeError)" in messages
+    assert not any("secret snapshot payload" in message for message in messages)
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +536,9 @@ async def test_session_hygiene_uses_matching_cached_fallback_runtime(
         base_url="https://chatgpt.com/backend-api/codex",
         api_key="test-runtime-key",
         api_mode="codex_responses",
-        credential_pool=SimpleNamespace(name="codex-pool"),
+        _credential_pool=SimpleNamespace(name="codex-pool"),
+        acp_command="/opt/copilot/custom-agent",
+        acp_args=["--stdio", "--profile", "fallback"],
         max_tokens=8192,
     )
     runner._agent_cache = {
@@ -505,7 +581,15 @@ async def test_session_hygiene_uses_matching_cached_fallback_runtime(
     assert CapturingCompressAgent.last_kwargs is not None
     assert CapturingCompressAgent.last_kwargs["provider"] == "openai-codex"
     assert CapturingCompressAgent.last_kwargs["model"] == "gpt-5.6-sol"
-    assert CapturingCompressAgent.last_kwargs["base_url"] != "https://api.anthropic.com"
+    assert CapturingCompressAgent.last_kwargs["base_url"] == fallback_agent.base_url
+    assert CapturingCompressAgent.last_kwargs["api_key"] == fallback_agent.api_key
+    assert CapturingCompressAgent.last_kwargs["api_mode"] == fallback_agent.api_mode
+    assert (
+        CapturingCompressAgent.last_kwargs["credential_pool"]
+        is fallback_agent._credential_pool
+    )
+    assert CapturingCompressAgent.last_kwargs["command"] == fallback_agent.acp_command
+    assert CapturingCompressAgent.last_kwargs["args"] == fallback_agent.acp_args
 
 
 @pytest.mark.asyncio
@@ -1111,36 +1195,65 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
 async def test_session_hygiene_auth_error_logs_root_cause_without_watchdog(
     monkeypatch, tmp_path, caplog
 ):
+    from agent.context_compressor import ContextCompressor
     from hermes_cli.auth import AuthError
 
     auth_message = "No Anthropic credentials found. Run hermes auth anthropic."
 
     class AuthFailingCompressAgent:
+        last_instance = None
+
         def __init__(self, **kwargs):
             self.session_id = kwargs.get("session_id", "sess-progress")
             self._last_compaction_in_place = False
-            self.context_compressor = SimpleNamespace(
-                bind_session_state=MagicMock(),
-                _last_compress_aborted=False,
-                _last_aux_model_failure_model=None,
+            self.context_compressor = ContextCompressor(
+                model=kwargs.get("model", "claude-fable-5"),
+                provider=kwargs.get("provider", "anthropic"),
+                base_url=kwargs.get("base_url", "https://api.anthropic.com"),
+                api_key=kwargs.get("api_key", "fake"),
+                api_mode=kwargs.get("api_mode", "anthropic_messages"),
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+                abort_on_summary_failure=False,
             )
             self.shutdown_memory_provider = MagicMock()
             self.close = MagicMock()
+            type(self).last_instance = self
 
         def _compress_context(self, messages, *_args, **_kwargs):
-            raise AuthError(auth_message, provider="anthropic")
+            compressed = self.context_compressor.compress(
+                messages,
+                current_tokens=999_999,
+                force=True,
+            )
+            return compressed, None
+
+    monkeypatch.setattr(
+        "agent.context_compressor.get_model_context_length",
+        lambda *_args, **_kwargs: 1_000,
+    )
+    monkeypatch.setattr(
+        "agent.context_compressor.call_llm",
+        MagicMock(side_effect=AuthError(auth_message, provider="anthropic")),
+    )
 
     runner, _adapter, event = _make_progress_runner(
         monkeypatch,
         tmp_path,
         AuthFailingCompressAgent,
-        "compression:\n  enabled: true\n  hygiene_timeout_seconds: 0.1\n",
+        "compression:\n  enabled: true\n  hygiene_timeout_seconds: 5\n",
     )
 
     assert await runner._handle_message(event) == "ok"
     messages = [record.getMessage() for record in caplog.records]
     assert f"Session hygiene auto-compress failed: {auth_message}" in messages
     assert not any("made no progress" in message for message in messages)
+    assert AuthFailingCompressAgent.last_instance is not None
+    compressor = AuthFailingCompressAgent.last_instance.context_compressor
+    assert compressor._last_compress_aborted is True
+    assert compressor._last_summary_fallback_used is False
+    assert compressor._last_summary_dropped_count == 0
     assert runner._run_agent.await_count == 1
 
 

@@ -1042,6 +1042,8 @@ Hermes uses "auxiliary" models for side tasks like image analysis, web page summ
 
 :::note Why "auto" uses your main model
 Earlier builds split aggregator users (OpenRouter, Nous Portal) onto a cheap provider-side default. That was surprising — users who paid for an aggregator subscription would see a different model handling their auxiliary traffic. `auto` now uses the main model for everyone, and per-task overrides in `config.yaml` still win (see [Full auxiliary config reference](#full-auxiliary-config-reference) below).
+
+Gateway pre-turn hygiene follows the currently active fallback runtime of the matching cached session when `auxiliary.compression.provider: auto`. It uses that fallback provider/model for context-window calculation and compression only; explicit compression provider pins are unchanged, and the normal conversation turn can still restore the primary runtime.
 :::
 
 ### Configuring auxiliary models interactively

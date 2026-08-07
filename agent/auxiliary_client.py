@@ -3702,6 +3702,17 @@ def _reset_aux_unhealthy_cache() -> None:
     _aux_unhealthy_logged_at.clear()
 
 
+_STRUCTURED_PAYMENT_ERROR_CODES = frozenset({"insufficient_quota"})
+_STRUCTURED_RATE_LIMIT_ERROR_CODES = frozenset(
+    {"codex_rate_limited", "rate_limit_exceeded"}
+)
+
+
+def _structured_capacity_error_code(exc: Exception) -> str:
+    """Return a normalized provider error code used for capacity routing."""
+    return str(getattr(exc, "code", "") or "").strip().lower()
+
+
 def _is_payment_error(exc: Exception) -> bool:
     """Detect payment/credit/quota exhaustion errors.
 
@@ -3714,6 +3725,9 @@ def _is_payment_error(exc: Exception) -> bool:
     exhaustion — the provider cannot serve the request until the quota
     resets — and should trigger the same provider-fallback logic.
     """
+    structured_code = _structured_capacity_error_code(exc)
+    if structured_code in _STRUCTURED_PAYMENT_ERROR_CODES:
+        return True
     status = getattr(exc, "status_code", None)
     if status == 402:
         return True
@@ -3764,6 +3778,11 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     Also catches OpenAI SDK RateLimitError instances that may not set
     .status_code on the exception object.
     """
+    structured_code = _structured_capacity_error_code(exc)
+    if structured_code in _STRUCTURED_PAYMENT_ERROR_CODES:
+        return False
+    if structured_code in _STRUCTURED_RATE_LIMIT_ERROR_CODES:
+        return True
     status = getattr(exc, "status_code", None)
     err_lower = str(exc).lower()
 
@@ -3905,6 +3924,10 @@ def _is_auth_error(exc: Exception) -> bool:
         from hermes_cli.auth import AuthError
 
         if isinstance(exc, AuthError):
+            # AuthError also carries Codex/OpenAI quota and rate-limit failures.
+            # Capacity failures must fall back without refreshing valid creds.
+            if _is_payment_error(exc) or _is_rate_limit_error(exc):
+                return False
             return True
     except ImportError:
         pass

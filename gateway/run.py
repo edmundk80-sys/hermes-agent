@@ -6829,8 +6829,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         session_key: str,
         session_id: str,
-    ) -> tuple[str, dict] | None:
-        """Return a snapshot of a matching cached agent's active fallback."""
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Copy a matching cached agent's active fallback constructor runtime.
+
+        ``AIAgent`` stores some constructor inputs under different runtime
+        attribute names. Keep that private-to-public translation explicit here
+        so hygiene rebuilds the same credential pool and ACP process runtime.
+        """
         try:
             cache_lock = getattr(self, "_agent_cache_lock", None)
             cache = getattr(self, "_agent_cache", None)
@@ -6866,22 +6871,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     if hasattr(agent, field):
                         runtime[field] = getattr(agent, field)
-                for field in ("credential_pool", "max_tokens"):
-                    if hasattr(agent, field):
-                        value = getattr(agent, field)
+                for source_field, runtime_field in (
+                    ("_credential_pool", "credential_pool"),
+                    ("max_tokens", "max_tokens"),
+                ):
+                    if hasattr(agent, source_field):
+                        value = getattr(agent, source_field)
                         if value is not None:
-                            runtime[field] = value
-                if hasattr(agent, "command"):
-                    command = getattr(agent, "command")
+                            runtime[runtime_field] = value
+                if hasattr(agent, "acp_command"):
+                    command = getattr(agent, "acp_command")
                     if command is not None:
                         runtime["command"] = command
-                if hasattr(agent, "args"):
-                    args = getattr(agent, "args")
+                if hasattr(agent, "acp_args"):
+                    args = getattr(agent, "acp_args")
                     if args is not None:
                         runtime["args"] = list(args)
 
                 return model, runtime
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "Session hygiene fallback runtime snapshot failed (%s)",
+                exc.__class__.__name__,
+            )
             return None
 
     def _resolve_session_agent_runtime(
@@ -16672,7 +16684,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if _active_hyg_runtime is not None:
                     _hyg_model, _hyg_runtime = _active_hyg_runtime
-                    logger.info(
+                    logger.debug(
                         "Session hygiene: following active runtime provider=%s model=%s",
                         _hyg_runtime.get("provider"),
                         _hyg_model,
@@ -17205,6 +17217,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             "activity stamp failed",
                                         )
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
+                                        logger.warning(
+                                            "Session hygiene auto-compress failed: %s",
+                                            _err,
+                                        )
                                         # Force-redact: provider exception text
                                         # may contain credentials; this message
                                         # reaches gateway users directly.
