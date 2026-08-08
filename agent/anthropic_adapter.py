@@ -7,10 +7,11 @@ adapter — all provider-specific logic is isolated here.
 Auth supports:
   - Regular API keys (sk-ant-api*) → x-api-key header
   - OAuth setup-tokens (sk-ant-oat*) → Bearer auth + beta header
-  - Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json) → Bearer auth
+  - Claude Code credentials (configured file or macOS Keychain) → Bearer auth
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ import platform
 import secrets
 import stat
 import subprocess
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -951,12 +953,65 @@ def build_anthropic_bedrock_client(region: str):
     )
 
 
+_CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _get_claude_config_dir() -> Path:
+    """Return Claude Code's configured credential directory.
+
+    ``CLAUDE_CONFIG_DIR`` relocates the whole Claude Code config tree. An empty
+    or unset value retains Claude Code's legacy default under ``~/.claude``.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".claude"
+
+
+def _get_claude_code_keychain_service() -> str:
+    """Return Claude Code's profile-aware macOS Keychain service name.
+
+    Claude Code keeps the legacy unsuffixed service when
+    ``CLAUDE_CONFIG_DIR`` is unset. For an explicit non-empty value it appends
+    the first eight hex characters of SHA-256 over the raw, NFC-normalized
+    environment value. The raw value is intentional: resolving or otherwise
+    normalizing the path would derive a different service from Claude Code.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not configured:
+        return _CLAUDE_CODE_KEYCHAIN_SERVICE
+    normalized = unicodedata.normalize("NFC", configured)
+    suffix = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
+    return f"{_CLAUDE_CODE_KEYCHAIN_SERVICE}-{suffix}"
+
+
+def _get_current_os_account() -> str:
+    """Return the effective macOS account when OS identity lookup succeeds."""
+    try:
+        import pwd
+
+        account = pwd.getpwuid(os.geteuid()).pw_name.strip()
+        if account:
+            return account
+    except (AttributeError, ImportError, KeyError, OSError):
+        pass
+
+    try:
+        account = os.getlogin().strip()
+        if account:
+            return account
+    except (AttributeError, OSError):
+        pass
+
+    return ""
+
+
 def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     """Read Claude Code OAuth credentials from the macOS Keychain.
 
-    Claude Code >=2.1.114 stores credentials in the macOS Keychain under the
-    service name "Claude Code-credentials" rather than (or in addition to)
-    the JSON file at ~/.claude/.credentials.json.
+    Claude Code >=2.1.114 stores credentials in the macOS Keychain. The
+    default config uses ``Claude Code-credentials``; an explicit
+    ``CLAUDE_CONFIG_DIR`` uses a profile-specific hashed service name.
 
     The password field contains a JSON string with the same claudeAiOauth
     structure as the JSON file.
@@ -966,28 +1021,44 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     if platform.system() != "Darwin":
         return None
 
+    service = _get_claude_code_keychain_service()
+    account = _get_current_os_account()
+    commands = []
+    if account:
+        commands.append([
+            "security", "find-generic-password",
+            "-s", service,
+            "-a", account,
+            "-w",
+        ])
+    commands.append([
+        "security", "find-generic-password",
+        "-s", service,
+        "-w",
+    ])
+
+    result = None
     try:
-        # Read the "Claude Code-credentials" generic password entry
-        result = subprocess.run(
-            ["security", "find-generic-password",
-             "-s", "Claude Code-credentials",
-             "-w"],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=5,
-            stdin=subprocess.DEVNULL,
-        )
+        for command in commands:
+            candidate = subprocess.run(
+                command,
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                timeout=5,
+                stdin=subprocess.DEVNULL,
+            )
+            if candidate.returncode == 0 and candidate.stdout.strip():
+                result = candidate
+                break
     except (OSError, subprocess.TimeoutExpired):
         logger.debug("Keychain: security command not available or timed out")
         return None
 
-    if result.returncode != 0:
-        logger.debug("Keychain: no entry found for 'Claude Code-credentials'")
+    if result is None:
+        logger.debug("Keychain: no entry found for configured Claude Code service")
         return None
 
     raw = result.stdout.strip()
-    if not raw:
-        return None
 
     try:
         data = json.loads(raw)
@@ -1010,17 +1081,17 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
 
 
 def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
-    """Read Claude Code OAuth credentials from ~/.claude/.credentials.json.
+    """Read OAuth credentials from the configured Claude Code directory.
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
+    cred_path = _get_claude_config_dir() / ".credentials.json"
     if not cred_path.exists():
         return None
     try:
         data = json.loads(cred_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, IOError) as e:
-        logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
+        logger.debug("Failed to read Claude Code credentials file: %s", e)
         return None
 
     oauth_data = data.get("claudeAiOauth")
@@ -1041,8 +1112,8 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     """Read refreshable Claude Code OAuth credentials.
 
     Reads from two possible sources and reconciles them:
-      1. macOS Keychain (Darwin only) — "Claude Code-credentials" entry
-      2. ~/.claude/.credentials.json file
+      1. macOS Keychain (Darwin only) — profile-aware Claude Code service
+      2. ``<CLAUDE_CONFIG_DIR>/.credentials.json`` (default: ``~/.claude``)
 
     Selection rules when both are present:
       - If exactly one is non-expired, prefer that one. (Handles the case
@@ -1216,14 +1287,14 @@ def _write_claude_code_credentials(
     *,
     scopes: Optional[list] = None,
 ) -> None:
-    """Write refreshed credentials back to ~/.claude/.credentials.json.
+    """Write refreshed credentials to the configured Claude Code directory.
 
     The optional *scopes* list (e.g. ``["user:inference", "user:profile", ...]``)
     is persisted so that Claude Code's own auth check recognises the credential
     as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
     in the stored scopes before it will use the token.
     """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
+    cred_path = _get_claude_config_dir() / ".credentials.json"
     try:
         # Read existing file to preserve other fields
         existing = {}

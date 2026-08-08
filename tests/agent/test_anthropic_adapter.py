@@ -1,8 +1,10 @@
 """Tests for agent/anthropic_adapter.py — Anthropic Messages API adapter."""
 
 import json
+import os
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
@@ -413,6 +415,17 @@ class TestRefreshOauthToken:
 
 
 class TestWriteClaudeCodeCredentials:
+    def test_suite_redirects_ambient_claude_config_before_writing(
+        self, tmp_path
+    ):
+        """The global test sandbox must win over an ambient developer profile."""
+        config_dir = Path(os.environ["CLAUDE_CONFIG_DIR"])
+        assert config_dir == tmp_path / ".claude"
+
+        _write_claude_code_credentials("tok", "ref", 12345)
+
+        assert (config_dir / ".credentials.json").exists()
+
     def test_writes_new_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         _write_claude_code_credentials("tok", "ref", 12345)

@@ -440,6 +440,13 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
+    # Claude Code supports relocating its credential file via
+    # CLAUDE_CONFIG_DIR. An ambient developer value must not outrank tests
+    # that monkeypatch Path.home(), otherwise synthetic refresh credentials
+    # can be written into a real profile. Pin it per test; tests of explicit
+    # config-dir behavior may still override it locally.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+
     # 3b. hermes_state computes ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``
     #     at import time. When the module is first imported at collection (any
     #     test file with a top-level ``from hermes_state import ...``) that
