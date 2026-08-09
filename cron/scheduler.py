@@ -46,7 +46,7 @@ from hermes_cli.config import (
     cron_model_drift_guard_enabled,
     load_config,
 )
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import get_runtime_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 
@@ -3339,7 +3339,7 @@ def run_job(
                 or primary_provider_for_drift
             )
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
-            fb_list = get_fallback_chain(_cfg)
+            fb_list = get_runtime_fallback_chain(_cfg)
             runtime = None
             for entry in fb_list:
                 if not isinstance(entry, dict):
@@ -3450,7 +3450,7 @@ def run_job(
                     f"(or pin the original values to keep them). See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        fallback_model = get_runtime_fallback_chain(_cfg) or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:

@@ -54,4 +54,41 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         # Should have been called at least twice (primary + fallback)
         assert call_count["n"] >= 2
 
+    def test_parent_startup_skips_openai_codex_fallback(self, tmp_path, monkeypatch):
+        """A stale gateway chain must not activate delegation-only Codex."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "fallback_providers:\n"
+            "  - provider: openai-codex\n"
+            "    model: gpt-5.6-sol\n"
+            "  - provider: openrouter\n"
+            "    model: x-ai/grok-4.5\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        requested = []
+
+        def _mock_resolve(**kwargs):
+            provider = kwargs.get("requested")
+            requested.append(provider)
+            return {
+                "api_key": f"{provider}-key",
+                "base_url": f"https://{provider}.example.invalid/v1",
+                "provider": provider,
+                "api_mode": "openai_chat",
+            }
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=_mock_resolve,
+        ):
+            from gateway.run import _try_resolve_fallback_provider
+
+            result = _try_resolve_fallback_provider()
+
+        assert result is not None
+        assert result["provider"] == "openrouter"
+        assert result["model"] == "x-ai/grok-4.5"
+        assert requested == ["openrouter"]
+
 

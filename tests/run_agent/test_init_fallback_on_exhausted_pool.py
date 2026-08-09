@@ -49,6 +49,41 @@ def test_init_tries_fallback_when_primary_returns_none():
         assert agent._fallback_activated is True
 
 
+def test_parent_init_skips_openai_codex_and_continues_fallback_chain():
+    """Init-time auth recovery must not activate delegation-only Codex."""
+    fallback = _mock_client()
+    requested = []
+
+    def fake_resolve(provider, model=None, raw_codex=False,
+                     explicit_base_url=None, explicit_api_key=None):
+        requested.append(provider)
+        if provider == "xai":
+            return fallback, "grok-4.5"
+        return None, None
+
+    with patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs()), \
+         patch("run_agent.check_toolset_requirements", return_value={}), \
+         patch("run_agent.OpenAI", return_value=MagicMock()):
+        agent = AIAgent(
+            provider="alibaba-coding-plan",
+            model="qwen3.6-plus",
+            api_key=None,
+            base_url=None,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=[
+                {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+                {"provider": "xai", "model": "grok-4.5"},
+            ],
+        )
+
+    assert requested == ["alibaba-coding-plan", "xai"]
+    assert agent.provider == "xai"
+    assert agent.model == "grok-4.5"
+
+
 def test_init_raises_when_no_fallback_configured():
     """When primary returns None and no fallback is set, should raise."""
     with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)), \

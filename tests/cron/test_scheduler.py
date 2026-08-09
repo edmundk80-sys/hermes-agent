@@ -688,6 +688,63 @@ class TestRunJobConfigEnvVarExpansion:
         assert kwargs["provider"] == "openrouter"
         assert kwargs["model"] == "z-ai/glm-5.2"
 
+    def test_parent_startup_skips_openai_codex_auth_fallback(self, tmp_path):
+        """A stale cron chain must not activate delegation-only Codex."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: claude-fable-5\n"
+            "  provider: anthropic\n"
+            "fallback_providers:\n"
+            "  - provider: openai-codex\n"
+            "    model: gpt-5.6-sol\n"
+            "  - provider: xai\n"
+            "    model: grok-4.5\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "parent-auth-fallback",
+            "name": "parent auth fallback",
+            "prompt": "hi",
+            "provider_snapshot": "anthropic",
+            "model_snapshot": "claude-fable-5",
+        }
+        fake_db = MagicMock()
+        requested = []
+
+        def resolve_runtime(**kwargs):
+            provider = kwargs.get("requested")
+            requested.append(provider)
+            if provider is None:
+                raise AuthError("Primary credentials unavailable")
+            return {
+                **self._RUNTIME,
+                "provider": provider,
+                "api_key": f"{provider}-key",
+            }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=resolve_runtime), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert requested == [None, "xai"]
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["provider"] == "xai"
+        assert kwargs["model"] == "grok-4.5"
+
 
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
         """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""

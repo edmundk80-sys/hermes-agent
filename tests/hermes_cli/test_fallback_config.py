@@ -1,7 +1,11 @@
 """Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from hermes_cli.fallback_config import resolve_entry_api_key
+from hermes_cli.fallback_config import (
+    get_fallback_chain,
+    get_runtime_fallback_chain,
+    resolve_entry_api_key,
+)
 
 
 class TestResolveEntryApiKey:
@@ -37,3 +41,35 @@ class TestResolveEntryApiKey:
         # secret scope installed, resolution still reads os.environ.
         monkeypatch.setenv("FB_KEY", "env-key")
         assert resolve_entry_api_key({"key_env": "FB_KEY"}) == "env-key"
+
+
+class TestRuntimeFallbackChain:
+    CONFIG = {
+        "fallback_providers": [
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            {"provider": "xai", "model": "grok-4.5"},
+        ]
+    }
+
+    def test_declared_chain_keeps_codex_for_display_and_introspection(self):
+        assert [entry["provider"] for entry in get_fallback_chain(self.CONFIG)] == [
+            "openai-codex",
+            "xai",
+        ]
+
+    def test_parent_runtime_chain_skips_codex_and_preserves_ordinary_entries(self):
+        assert [
+            entry["provider"] for entry in get_runtime_fallback_chain(self.CONFIG)
+        ] == ["xai"]
+
+    def test_delegated_child_runtime_chain_preserves_codex_sol(self):
+        from agent.delegation_context import delegated_child_context
+
+        with delegated_child_context():
+            chain = get_runtime_fallback_chain(self.CONFIG)
+
+        assert chain[0] == {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+        }
+        assert [entry["provider"] for entry in chain] == ["openai-codex", "xai"]

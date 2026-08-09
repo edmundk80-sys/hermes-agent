@@ -5912,15 +5912,15 @@ def _parse_tui_skills_env() -> list[str]:
 def _load_fallback_model():
     """Return the configured fallback chain for TUI-created agents.
 
-    Delegates to the shared ``get_fallback_chain`` helper so the TUI path
+    Delegates to the shared runtime-chain helper so the TUI path
     stays in parity with ``HermesCLI.__init__`` and ``gateway/run.py``:
     ``fallback_providers`` is the primary source of truth and keeps its
     order, with legacy ``fallback_model`` entries merged in afterwards
     (deduped on provider/model/base_url).
     """
-    from hermes_cli.fallback_config import get_fallback_chain
+    from hermes_cli.fallback_config import get_runtime_fallback_chain
 
-    return get_fallback_chain(_load_cfg())
+    return get_runtime_fallback_chain(_load_cfg())
 
 
 def _agent_fallback_model(agent):
@@ -6241,6 +6241,10 @@ def _resolve_runtime_with_fallback(
             False,
         )
     except AuthError as primary_exc:
+        from hermes_cli.fallback_config import (
+            fallback_entry_allowed_in_current_context,
+        )
+
         fb_chain = _load_fallback_model() or []
         for entry in fb_chain:
             if not isinstance(entry, dict):
@@ -6248,6 +6252,14 @@ def _resolve_runtime_with_fallback(
             fb_provider = str(entry.get("provider") or "").strip()
             fb_model = str(entry.get("model") or "").strip()
             if not fb_provider or not fb_model:
+                continue
+            if not fallback_entry_allowed_in_current_context(entry):
+                logging.getLogger(__name__).warning(
+                    "Fallback skip: refusing parent startup activation of "
+                    "delegation-only %s/%s",
+                    fb_provider,
+                    fb_model,
+                )
                 continue
             try:
                 from hermes_cli.fallback_config import resolve_entry_api_key
@@ -6262,8 +6274,6 @@ def _resolve_runtime_with_fallback(
                 if fb_api_key:
                     fb_kwargs["explicit_api_key"] = fb_api_key
                 runtime = resolve_runtime_provider(**fb_kwargs)
-                import logging
-
                 logging.getLogger(__name__).warning(
                     "Primary auth failed (%s), falling back to %s model %s",
                     primary_exc,

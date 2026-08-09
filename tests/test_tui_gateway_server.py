@@ -15272,6 +15272,42 @@ class TestResolveRuntimeWithFallback:
         assert resolution.selected_model == "deepseek-v4-pro"
         assert resolution.used_fallback is True
 
+    def test_parent_auth_error_skips_openai_codex_fallback(self, monkeypatch):
+        """TUI parent startup must continue past delegation-only Codex."""
+        from hermes_cli.auth import AuthError
+
+        requested = []
+        fallback_runtime = {"provider": "xai", "api_key": "fb-tok"}
+
+        def fake_resolve(**kwargs):
+            provider = kwargs.get("requested")
+            requested.append(provider)
+            if provider == "anthropic":
+                raise AuthError("No Anthropic credentials stored")
+            return fallback_runtime
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve,
+        )
+        monkeypatch.setattr(
+            server,
+            "_load_fallback_model",
+            lambda: [
+                {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+                {"provider": "xai", "model": "grok-4.5"},
+            ],
+        )
+
+        resolution = server._resolve_runtime_with_fallback(
+            {"requested": "anthropic"},
+        )
+
+        assert requested == ["anthropic", "xai"]
+        assert resolution.runtime == fallback_runtime
+        assert resolution.selected_model == "grok-4.5"
+        assert resolution.used_fallback is True
+
     def test_auth_error_skips_provider_only_fallback(self, monkeypatch):
         """Auth fallback requires one complete provider/model pair."""
         from hermes_cli.auth import AuthError

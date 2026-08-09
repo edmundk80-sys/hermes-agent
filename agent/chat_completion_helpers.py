@@ -1745,6 +1745,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
 
+    # Codex is reserved for explicit delegate_task children.  Long-lived parent
+    # agents can retain a fallback chain loaded before config routing was
+    # repaired, so enforce the boundary at activation time instead of trusting
+    # the cached chain.  delegated_child_context() remains active for the full
+    # child conversation, preserving delegated Codex/Sol execution.
+    from hermes_cli.fallback_config import fallback_entry_allowed_in_current_context
+
+    if not fallback_entry_allowed_in_current_context(fb):
+        logger.warning(
+            "Fallback skip: refusing parent activation of delegation-only %s/%s",
+            fb_provider,
+            fb_model,
+        )
+        return agent._try_activate_fallback(reason)
+
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
         unavailable.add(fb_key)

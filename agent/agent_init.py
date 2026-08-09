@@ -1236,14 +1236,11 @@ def init_agent(
                     except Exception:
                         pass
                     # --- Init-time fallback (#17929) ---
-                    _fb_entries = []
-                    if isinstance(fallback_model, list):
-                        _fb_entries = [
-                            f for f in fallback_model
-                            if isinstance(f, dict) and f.get("provider") and f.get("model")
-                        ]
-                    elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
-                        _fb_entries = [fallback_model]
+                    from hermes_cli.fallback_config import (
+                        filter_runtime_fallback_chain,
+                    )
+
+                    _fb_entries = filter_runtime_fallback_chain(fallback_model)
                     _fb_resolved = False
                     for _fb in _fb_entries:
                         try:
@@ -1387,15 +1384,9 @@ def init_agent(
     # when the primary is exhausted (rate-limit, overload, connection
     # failure).  Supports both legacy single-dict ``fallback_model`` and
     # new list ``fallback_providers`` format.
-    if isinstance(fallback_model, list):
-        agent._fallback_chain = [
-            f for f in fallback_model
-            if isinstance(f, dict) and f.get("provider") and f.get("model")
-        ]
-    elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
-        agent._fallback_chain = [fallback_model]
-    else:
-        agent._fallback_chain = []
+    from hermes_cli.fallback_config import filter_runtime_fallback_chain
+
+    agent._fallback_chain = filter_runtime_fallback_chain(fallback_model)
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)

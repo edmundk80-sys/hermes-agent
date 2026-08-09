@@ -77,7 +77,7 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
-def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
+def get_fallback_chain(config: Any) -> list[dict[str, Any]]:
     """Return the effective fallback chain merged across old and new config keys.
 
     ``fallback_providers`` remains the primary source of truth and keeps its
@@ -86,7 +86,7 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     The returned list always contains fresh dict copies.
     """
 
-    config = config or {}
+    config = config if isinstance(config, dict) else {}
     chain: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
@@ -99,3 +99,39 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
             chain.append(entry)
 
     return chain
+
+
+def fallback_entry_allowed_in_current_context(entry: object) -> bool:
+    """Return whether a configured fallback entry may activate at runtime.
+
+    This deliberately does not affect :func:`get_fallback_chain`: config
+    display, validation, and editing must keep showing the user's declared
+    chain. Runtime activation sinks call this helper (or one of the filtered
+    chain helpers below) so delegation-only providers fail closed in parents.
+    """
+    if not isinstance(entry, dict):
+        return False
+
+    from agent.delegation_context import (
+        fallback_provider_allowed_in_current_context,
+    )
+
+    return fallback_provider_allowed_in_current_context(entry.get("provider"))
+
+
+def filter_runtime_fallback_chain(raw: Any) -> list[dict[str, Any]]:
+    """Normalize *raw* fallback entries and keep only runtime-eligible routes."""
+    return [
+        entry
+        for entry in _iter_fallback_entries(raw)
+        if fallback_entry_allowed_in_current_context(entry)
+    ]
+
+
+def get_runtime_fallback_chain(config: Any) -> list[dict[str, Any]]:
+    """Return the effective chain filtered for activation in this context."""
+    return [
+        entry
+        for entry in get_fallback_chain(config)
+        if fallback_entry_allowed_in_current_context(entry)
+    ]

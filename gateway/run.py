@@ -61,7 +61,10 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.config import cfg_get
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import (
+    filter_runtime_fallback_chain,
+    get_runtime_fallback_chain,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -2521,7 +2524,7 @@ def _try_resolve_fallback_provider() -> dict | None:
         # root-model normalization now reach the fallback chain too (a raw
         # read here used to miss administrator-pinned fallback_providers).
         cfg = _load_gateway_runtime_config()
-        fb_list = get_fallback_chain(cfg)
+        fb_list = get_runtime_fallback_chain(cfg)
         if not fb_list:
             return None
         for entry in fb_list:
@@ -8348,7 +8351,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Canonical gateway loader (fail-open): managed overlay + ${VAR}
             # expansion now apply to the fallback chain too.
             cfg = _load_gateway_runtime_config()
-            fb = get_fallback_chain(cfg)
+            fb = get_runtime_fallback_chain(cfg)
             if fb:
                 return fb
         except Exception:
@@ -8399,7 +8402,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "keeping last known-good chain", exc_info=True,
             )
             return self._fallback_model
-        self._fallback_model = get_fallback_chain(cfg) or None
+        self._fallback_model = get_runtime_fallback_chain(cfg) or None
         return self._fallback_model
 
     @staticmethod
@@ -8414,7 +8417,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if agent is None:
             return
-        new_chain = list(chain or [])
+        new_chain = filter_runtime_fallback_chain(chain)
         rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
         if (
             getattr(agent, "_fallback_activated", False)

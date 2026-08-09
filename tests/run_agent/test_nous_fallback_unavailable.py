@@ -47,7 +47,7 @@ class TestNousFallbackLocalAvailability:
         agent = _make_agent(
             fallback_model=[
                 {"provider": "nous", "model": "anthropic/claude-sonnet-4.6"},
-                {"provider": "openai-codex", "model": "gpt-5.5"},
+                {"provider": "openrouter", "model": "openai/gpt-5.5"},
             ]
         )
         with patch(
@@ -55,11 +55,15 @@ class TestNousFallbackLocalAvailability:
             return_value={},
         ), patch(
             "agent.auxiliary_client.resolve_provider_client",
-            return_value=(_mock_client(api_key="fb"), "gpt-5.5"),
+            return_value=(
+                _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb"),
+                "openai/gpt-5.5",
+            ),
         ):
             activated = agent._try_activate_fallback(None)
         assert activated is True
-        assert agent.model == "gpt-5.5"
+        assert agent.provider == "openrouter"
+        assert agent.model == "openai/gpt-5.5"
 
     def test_nous_unavailable_not_retried_in_same_session(self):
         """After Nous is skipped once, subsequent activations continue further."""

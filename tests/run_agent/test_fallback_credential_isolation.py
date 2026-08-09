@@ -121,7 +121,8 @@ class TestFallbackCredentialIsolation:
         )
 
     def test_fallback_attaches_matching_pool_after_clear(self):
-        """Provider-switch fallback should attach the fallback provider's pool."""
+        """Delegated provider-switch fallback attaches the matching Codex pool."""
+        from agent.delegation_context import delegated_child_context
         from agent.chat_completion_helpers import try_activate_fallback
 
         agent = _make_agent(
@@ -148,13 +149,17 @@ class TestFallbackCredentialIsolation:
         )
         fallback_pool = _make_pool("openai-codex")
 
-        with patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(fallback_client, "gpt-5.5"),
-        ) as resolve_provider_client, patch(
-            "agent.credential_pool.load_pool",
-            return_value=fallback_pool,
-        ) as load_pool:
+        with (
+            delegated_child_context(),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, "gpt-5.5"),
+            ) as resolve_provider_client,
+            patch(
+                "agent.credential_pool.load_pool",
+                return_value=fallback_pool,
+            ) as load_pool,
+        ):
             assert try_activate_fallback(agent) is True
 
         resolve_provider_client.assert_called_once()

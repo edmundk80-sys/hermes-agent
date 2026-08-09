@@ -86,6 +86,41 @@ class TestFallbackChainAdvancement:
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
 
+    def test_parent_skips_stale_openai_codex_fallback_candidate(self):
+        """A cached pre-repair chain must not route a parent turn to Codex."""
+        agent = _make_agent(fallback_model=None)
+        stale = {"provider": "openai-codex", "model": "gpt-5.6-sol"}
+        agent._fallback_chain = [stale]
+        agent._fallback_model = stale
+        agent._fallback_index = 0
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-5.6-sol"),
+        ) as mock_resolve:
+            assert agent._try_activate_fallback() is False
+
+        assert agent.provider != "openai-codex"
+        mock_resolve.assert_not_called()
+
+    def test_delegated_child_can_activate_openai_codex_fallback(self):
+        """The parent-only guard must preserve delegated Codex/Sol routing."""
+        from agent.delegation_context import delegated_child_context
+
+        with delegated_child_context():
+            agent = _make_agent(fallback_model=[
+                {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            ])
+
+            with patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-5.6-sol"),
+            ):
+                assert agent._try_activate_fallback() is True
+
+        assert agent.provider == "openai-codex"
+        assert agent.model == "gpt-5.6-sol"
+
 
 
     def test_skips_unconfigured_provider_to_next(self):

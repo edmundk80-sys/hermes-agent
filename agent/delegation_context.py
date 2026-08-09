@@ -55,6 +55,16 @@ def is_delegated_child_context() -> bool:
     return bool(_DELEGATED_CHILD_CONTEXT.get())
 
 
+def fallback_provider_allowed_in_current_context(provider: object) -> bool:
+    """Return whether *provider* may be activated as a fallback here.
+
+    Codex fallback is delegation-only.  Check this at every activation sink so
+    stale parent config or cached session chains cannot bypass routing policy.
+    """
+    normalized = str(provider or "").strip().lower()
+    return normalized != "openai-codex" or is_delegated_child_context()
+
+
 def is_delegated_child_process_context() -> bool:
     """Return True in this process or a subprocess spawned by a child."""
     import os

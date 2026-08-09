@@ -5190,12 +5190,17 @@ def _try_configured_fallback_chain(
     )
     tried = []
     min_ctx = _task_minimum_context_length(task)
+    from hermes_cli.fallback_config import (
+        fallback_entry_allowed_in_current_context,
+    )
 
     for i, entry in enumerate(chain):
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
         if not fb_provider:
+            continue
+        if not fallback_entry_allowed_in_current_context(entry):
             continue
         fb_model_raw = str(entry.get("model", "")).strip()
         if should_skip_candidate(
@@ -5316,15 +5321,15 @@ def _try_main_fallback_chain(
 
     ``provider: auto`` auxiliary tasks should respect the user's declared
     main fallback policy before dropping into Hermes' built-in discovery
-    chain. The top-level chain is read through ``get_fallback_chain`` so
+    chain. The top-level chain is read through ``get_runtime_fallback_chain`` so
     both modern ``fallback_providers`` and legacy ``fallback_model`` entries
     participate in the same order as the main agent.
     """
     try:
         from hermes_cli.config import load_config_readonly
-        from hermes_cli.fallback_config import get_fallback_chain
+        from hermes_cli.fallback_config import get_runtime_fallback_chain
 
-        chain = get_fallback_chain(load_config_readonly())
+        chain = get_runtime_fallback_chain(load_config_readonly())
     except Exception as exc:
         logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", exc)
         return None, None, ""
@@ -5337,6 +5342,9 @@ def _try_main_fallback_chain(
     skip = {p for p in (failed_norm, main_norm, "auto") if p}
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
+    from hermes_cli.fallback_config import (
+        fallback_entry_allowed_in_current_context,
+    )
 
     for i, entry in enumerate(chain):
         if not isinstance(entry, dict):
@@ -5344,6 +5352,9 @@ def _try_main_fallback_chain(
         fb_provider = str(entry.get("provider") or "").strip()
         fb_model = str(entry.get("model") or "").strip()
         if not fb_provider or not fb_model:
+            continue
+        if not fallback_entry_allowed_in_current_context(entry):
+            tried.append(f"fallback_providers[{i}]({fb_provider}) (policy skipped)")
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"

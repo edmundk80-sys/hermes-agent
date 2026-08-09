@@ -50,11 +50,23 @@ class CLIAgentSetupMixin:
         if runtime is None and _primary_exc is not None:
             from hermes_cli.auth import AuthError
             if isinstance(_primary_exc, AuthError):
+                from hermes_cli.fallback_config import (
+                    fallback_entry_allowed_in_current_context,
+                )
+
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
                 for _fb in _fb_chain:
                     _fb_provider = (_fb.get("provider") or "").strip().lower()
                     _fb_model = (_fb.get("model") or "").strip()
                     if not _fb_provider or not _fb_model:
+                        continue
+                    if not fallback_entry_allowed_in_current_context(_fb):
+                        logger.warning(
+                            "Fallback skip: refusing parent startup activation of "
+                            "delegation-only %s/%s",
+                            _fb_provider,
+                            _fb_model,
+                        )
                         continue
                     try:
                         from hermes_cli.fallback_config import resolve_entry_api_key
